@@ -11,3 +11,19 @@ services:
         sync: false
       - key: WEBHOOK_SECRET
         sync: false
+
+  - type: cron
+    name: signabot-scanner
+    runtime: python
+    schedule: "*/1 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scanner.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: SIGNAL_SYMBOLS
+        value: BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,DOTUSDT
+      - key: SIGNAL_TIMEFRAMES
+        value: 15m,1h
