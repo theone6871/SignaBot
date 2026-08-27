@@ -1,9 +1,14 @@
 import os
-import time
-import threading
 import requests
-import ccxt
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from scanner import start_background
+
+load_dotenv()
+
+app = Flask(__name__)
+
+start_background()
 
 load_dotenv()
 
