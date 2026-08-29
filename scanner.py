@@ -1,305 +1,421 @@
 import os
+import time
 import requests
-from flask import Flask, request, jsonify
+import ccxt
 from dotenv import load_dotenv
-from scanner import start_background
 
 load_dotenv()
-
-app = Flask(__name__)
-
-start_background()
-
-load_dotenv()
-
-print("SIGNABOT SCANNER STARTING...", flush=True)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 SYMBOLS = [
-    x.strip().upper()
-    for x in os.getenv("SIGNAL_SYMBOLS", "BTCUSDT").split(",")
-    if x.strip()
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
 ]
 
-TIMEFRAMES = [
-    x.strip()
-    for x in os.getenv("SIGNAL_TIMEFRAMES", "15m,1h").split(",")
-    if x.strip()
-]
+TIMEFRAMES = ["15m", "1h"]
 
-SYMBOLS = [x.replace("USDT", "/USDT") for x in SYMBOLS]
+SCAN_SECONDS = 60
+MAX_SIGNALS_PER_DAY = 4
+MIN_RR = 2.0
 
 exchange = ccxt.bitget({
     "enableRateLimit": True,
 })
 
-sent = set()
+sent_signals = set()
+daily_signals = 0
+current_day = None
 
 
-def send(text):
-    if not TOKEN or not CHAT:
-        print("TELEGRAM CONFIG ERROR", flush=True)
-        return
-
+def send_telegram(text):
     r = requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT, "text": text},
-        timeout=20,
+        json={
+            "chat_id": CHAT_ID,
+            "text": text
+        },
+        timeout=20
     )
     r.raise_for_status()
 
 
-def candles(symbol, tf, limit=300):
-    data = exchange.fetch_ohlcv(
+def get_candles(symbol, timeframe):
+    return exchange.fetch_ohlcv(
         symbol,
-        timeframe=tf,
-        limit=limit
+        timeframe=timeframe,
+        limit=300
     )
 
-    return [
-        {
-            "h": float(x[2]),
-            "l": float(x[3]),
-            "c": float(x[4])
-        }
-        for x in data
-    ]
 
+def atr(candles, period=14):
+    trs = []
 
-def atr(c, n=14):
-    tr = []
+    for i in range(1, len(candles)):
+        high = candles[i][2]
+        low = candles[i][3]
+        previous_close = candles[i - 1][4]
 
-    for i in range(1, len(c)):
-        tr.append(
+        trs.append(
             max(
-                c[i]["h"] - c[i]["l"],
-                abs(c[i]["h"] - c[i-1]["c"]),
-                abs(c[i]["c"] - c[i-1]["c"])
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close)
             )
         )
 
-    return sum(tr[-n:]) / min(n, len(tr)) if tr else 0
+    if len(trs) < period:
+        return 0
+
+    return sum(trs[-period:]) / period
 
 
-def detect(c):
+def swing_high(candles, i, strength=3):
+    if i < strength or i >= len(candles) - strength:
+        return False
 
-    if len(c) < 80:
+    value = candles[i][2]
+
+    for j in range(1, strength + 1):
+        if value <= candles[i-j][2]:
+            return False
+        if value <= candles[i+j][2]:
+            return False
+
+    return True
+
+
+def swing_low(candles, i, strength=3):
+    if i < strength or i >= len(candles) - strength:
+        return False
+
+    value = candles[i][3]
+
+    for j in range(1, strength + 1):
+        if value >= candles[i-j][3]:
+            return False
+        if value >= candles[i+j][3]:
+            return False
+
+    return True
+
+
+def detect_choch(candles):
+
+    if len(candles) < 100:
         return None
 
-    w = c[-160:]
-    a = atr(w)
+    data = candles[-180:]
 
-    if a <= 0:
+    highs = []
+    lows = []
+
+    for i in range(5, len(data) - 5):
+
+        if swing_high(data, i):
+            highs.append(i)
+
+        if swing_low(data, i):
+            lows.append(i)
+
+    if len(highs) < 2 or len(lows) < 2:
         return None
 
-    first = sum(x["c"] for x in w[:5]) / 5
-    last = sum(x["c"] for x in w[-5:]) / 5
+    last_high = highs[-1]
+    previous_high = highs[-2]
 
-    # UP TREND -> HIGH -> PULLBACK -> SHORT
-    if last - first > 1.2 * a:
+    last_low = lows[-1]
+    previous_low = lows[-2]
 
-        ei = max(range(len(w)), key=lambda i: w[i]["h"])
+    price = data[-1][4]
 
-        if ei < 15 or ei > len(w) - 5:
-            return None
+    # ==========================
+    # BULLISH TREND → CHOCH DOWN
+    # ==========================
 
-        si = min(
-            range(max(0, ei - 60), ei),
-            key=lambda i: w[i]["l"]
-        )
+    bullish = (
+        data[last_high][2] > data[previous_high][2]
+        and
+        data[last_low][3] > data[previous_low][3]
+    )
 
-        lo = w[si]["l"]
-        hi = w[ei]["h"]
-        rng = hi - lo
+    if bullish:
 
-        if rng <= 0:
-            return None
+        choch_level = data[last_low][3]
 
-        pb = min(x["l"] for x in w[ei+1:])
+        # قیمت باید واقعاً ساختار را بشکند
+        if price < choch_level:
 
-        if hi - pb < 0.25 * rng:
-            return None
+            low = data[previous_low][3]
+            high = data[last_high][2]
 
-        if not any(
-            x["c"] < lo + 0.66 * rng
-            for x in w[ei+1:]
-        ):
-            return None
+            rng = high - low
 
-        levels = {
-            k: hi - rng * k
-            for k in [0, .66, .70, .786, .83, 1]
-        }
+            if rng <= 0:
+                return None
 
-        return (
-            "SHORT",
-            levels[.786],
-            levels[.83],
-            hi,
-            lo
-        )
+            # Fib retracement zone
+            entry1 = high - rng * 0.786
+            entry2 = high - rng * 0.83
 
-    # DOWN TREND -> LOW -> PULLBACK -> LONG
-    if first - last > 1.2 * a:
+            # برای SHORT باید قیمت زیر Entry نباشد
+            if price < min(entry1, entry2):
+                return None
 
-        ei = min(range(len(w)), key=lambda i: w[i]["l"])
+            # برای SHORT باید قیمت داخل یا نزدیک Zone باشد
+            zone_low = min(entry1, entry2)
+            zone_high = max(entry1, entry2)
 
-        if ei < 15 or ei > len(w) - 5:
-            return None
+            tolerance = max(
+                atr(data) * 0.15,
+                price * 0.0005
+            )
 
-        si = max(
-            range(max(0, ei - 60), ei),
-            key=lambda i: w[i]["h"]
-        )
+            if price > zone_high + tolerance:
+                return None
 
-        hi = w[si]["h"]
-        lo = w[ei]["l"]
-        rng = hi - lo
+            sl = high
+            tp = low
 
-        if rng <= 0:
-            return None
+            risk = sl - price
+            reward = price - tp
 
-        pb = max(x["h"] for x in w[ei+1:])
+            if risk <= 0 or reward <= 0:
+                return None
 
-        if pb - lo < 0.25 * rng:
-            return None
+            rr = reward / risk
 
-        if not any(
-            x["c"] > hi - 0.66 * rng
-            for x in w[ei+1:]
-        ):
-            return None
+            if rr < MIN_RR:
+                return None
 
-        levels = {
-            k: lo + rng * k
-            for k in [0, .66, .70, .786, .83, 1]
-        }
+            return {
+                "side": "SHORT",
+                "entry1": entry1,
+                "entry2": entry2,
+                "sl": sl,
+                "tp": tp,
+                "rr": rr
+            }
 
-        return (
-            "LONG",
-            levels[.786],
-            levels[.83],
-            lo,
-            hi
-        )
+    # ==========================
+    # BEARISH TREND → CHOCH UP
+    # ==========================
+
+    bearish = (
+        data[last_low][3] < data[previous_low][3]
+        and
+        data[last_high][2] < data[previous_high][2]
+    )
+
+    if bearish:
+
+        choch_level = data[last_high][2]
+
+        if price > choch_level:
+
+            high = data[previous_high][2]
+            low = data[last_low][3]
+
+            rng = high - low
+
+            if rng <= 0:
+                return None
+
+            entry1 = low + rng * 0.786
+            entry2 = low + rng * 0.83
+
+            # برای LONG قیمت نباید بالاتر از Zone باشد
+            if price > max(entry1, entry2):
+                return None
+
+            zone_low = min(entry1, entry2)
+            zone_high = max(entry1, entry2)
+
+            tolerance = max(
+                atr(data) * 0.15,
+                price * 0.0005
+            )
+
+            if price < zone_low - tolerance:
+                return None
+
+            sl = low
+            tp = high
+
+            risk = price - sl
+            reward = tp - price
+
+            if risk <= 0 or reward <= 0:
+                return None
+
+            rr = reward / risk
+
+            if rr < MIN_RR:
+                return None
+
+            return {
+                "side": "LONG",
+                "entry1": entry1,
+                "entry2": entry2,
+                "sl": sl,
+                "tp": tp,
+                "rr": rr
+            }
 
     return None
 
 
-def scan_once():
+def scan():
+
+    global daily_signals
+    global current_day
+
+    today = time.strftime("%Y-%m-%d")
+
+    if current_day != today:
+        current_day = today
+        daily_signals = 0
+        sent_signals.clear()
+
+    print("\n==============================")
+    print("SIGNABOT LIVE SCAN")
+    print("==============================")
 
     for symbol in SYMBOLS:
 
-        for tf in TIMEFRAMES:
+        for timeframe in TIMEFRAMES:
 
             try:
 
-                c = candles(symbol, tf)
+                candles = get_candles(
+                    symbol,
+                    timeframe
+                )
 
-                sig = detect(c)
+                price = candles[-1][4]
 
-                price = c[-1]["c"]
+                signal = detect_choch(candles)
+
+                if signal is None:
+
+                    print(
+                        f"[NO VALID SIGNAL] "
+                        f"{symbol} {timeframe} "
+                        f"PRICE={price}",
+                        flush=True
+                    )
+
+                    continue
 
                 print(
-                    f"[SCAN] {symbol} {tf} PRICE={price}",
+                    f"[VALID CHOCH] "
+                    f"{symbol} {timeframe} "
+                    f"{signal['side']} "
+                    f"PRICE={price} "
+                    f"ENTRY1={signal['entry1']} "
+                    f"ENTRY2={signal['entry2']} "
+                    f"RR={signal['rr']:.2f}",
                     flush=True
                 )
 
-                if not sig:
-                    continue
-
-                side, e1, e2, sl, tp = sig
-
-                tol = max(
-                    atr(c) * 0.20,
-                    price * 0.001
-                )
-
-                if min(
-                    abs(price - e1),
-                    abs(price - e2)
-                ) > tol:
+                if daily_signals >= MAX_SIGNALS_PER_DAY:
+                    print(
+                        "[DAILY LIMIT REACHED]",
+                        flush=True
+                    )
                     continue
 
                 key = (
-                    f"{symbol}:{tf}:{side}:"
-                    f"{round(e1, 4)}"
+                    symbol,
+                    timeframe,
+                    signal["side"],
+                    round(signal["entry1"], 4)
                 )
 
-                if key in sent:
+                if key in sent_signals:
                     continue
 
-                sent.add(key)
+                sent_signals.add(key)
+                daily_signals += 1
 
-                message = (
-                    "🚨 SIGNABOT CHOCH SIGNAL\n\n"
-                    f"{symbol} | {tf}\n"
-                    f"SIDE: {side}\n"
-                    f"PRICE: {price}\n\n"
-                    f"ENTRY 1: {e1:.6f}\n"
-                    f"ENTRY 2: {e2:.6f}\n"
-                    f"SL: {sl:.6f}\n"
-                    f"TP: {tp:.6f}\n\n"
-                    "Wave → Extreme → Pullback → CHOCH\n"
-                    "Fib: 0 / 0.66 / 0.70 / 0.786 / 0.83 / 1"
-                )
+                message = f"""
+🚨 SIGNABOT — VALID CHOCH SIGNAL
 
-                send(message)
+━━━━━━━━━━━━━━━━
+{symbol}
+TIMEFRAME: {timeframe}
+━━━━━━━━━━━━━━━━
+
+📌 DIRECTION:
+{signal['side']}
+
+💰 CURRENT:
+{price:.6f}
+
+🎯 ENTRY 1:
+{signal['entry1']:.6f}
+
+🎯 ENTRY 2:
+{signal['entry2']:.6f}
+
+🛑 STOP LOSS:
+{signal['sl']:.6f}
+
+🎯 TARGET:
+{signal['tp']:.6f}
+
+📊 RISK / REWARD:
+1 : {signal['rr']:.2f}
+
+📐 FIB:
+0 → 0.66 → 0.70 → 0.786 → 0.83 → 1
+
+📊 STRUCTURE:
+TREND → SWING → CHOCH → PULLBACK
+
+⚠️ MANUAL TRADE ONLY
+⚠️ AUTO TRADE: OFF
+"""
+
+                send_telegram(message)
 
                 print(
-                    f"🚨 SIGNAL SENT {symbol} {tf} {side}",
+                    "🚨 TELEGRAM SIGNAL SENT",
                     flush=True
                 )
 
             except Exception as e:
 
                 print(
-                    "SCAN ERROR",
-                    symbol,
-                    tf,
-                    repr(e),
+                    f"SCAN ERROR "
+                    f"{symbol} {timeframe}: {repr(e)}",
                     flush=True
                 )
 
 
-def run_forever():
+print("================================")
+print("SIGNABOT LIVE ENGINE STARTED")
+print("================================")
+print("Exchange : BITGET")
+print("Mode     : SIGNAL ONLY")
+print("AutoTrade: OFF")
+print("Max Daily Signals: 4")
+print("Minimum RR: 1:2")
+print("================================")
 
-    print(
-        "SIGNABOT LIVE ENGINE STARTED",
-        flush=True
-    )
+while True:
 
-    print(
-        f"Exchange: BITGET",
-        flush=True
-    )
+    try:
+        scan()
 
-    print(
-        f"Symbols: {SYMBOLS}",
-        flush=True
-    )
+    except Exception as e:
+        print(
+            f"ENGINE ERROR: {repr(e)}",
+            flush=True
+        )
 
-    print(
-        f"Timeframes: {TIMEFRAMES}",
-        flush=True
-    )
-
-    while True:
-
-        scan_once()
-
-        time.sleep(60)
-
-
-def start_background():
-
-    thread = threading.Thread(
-        target=run_forever,
-        daemon=True
-    )
-
-    thread.start()
-
-    return thread
+    time.sleep(SCAN_SECONDS)
